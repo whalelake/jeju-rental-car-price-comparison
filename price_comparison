@@ -1,0 +1,2044 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import re
+import os
+import json
+import requests
+import pandas as pd
+import urllib.parse
+from datetime import datetime, timedelta
+import time
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+
+# ================= Configuration =================
+SAVE_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+os.makedirs(SAVE_DIR, exist_ok=True)
+TIMEOUT = 60.0
+TRAVEL_TERMS = [2]  # days of trip
+
+# ================================================
+
+def clean_vendor_name(vendor_name):
+    """
+    렌터카 업체명을 정리하는 함수
+    """
+    if not vendor_name:
+        return ""
+    
+    # 기본 정리
+    cleaned = vendor_name.replace(" ", "").replace("렌트카", "").replace("렌터카", "").replace("더", "").replace("R", "").replace("국제","조아").replace("씽씽","제주야").replace("차세대","자보")
+    
+    # 특정 제주 업체들에서만 "제주" 제거
+    jeju_companies = ["매일", "아산", "알프스", "자연", "카카", "타요", "탐라", "평화", "한라", "OK", "공항"]
+    
+    # 제주로 시작하고 위 업체명 중 하나를 포함하는 경우만 제주 제거
+    if cleaned.startswith("제주"):
+        for company in jeju_companies:
+            if company in cleaned:
+                cleaned = cleaned.replace("제주", "", 1)  # 첫 번째 "제주"만 제거
+                break
+    
+    return cleaned
+
+def parse_car_name(original_name):
+    """
+    차량명에서 세대 정보, 연료 타입, 연식만 분리하는 함수
+    차량명은 건드리지 않음
+    
+    Args:
+        original_name (str): 원본 차량명
+    
+    Returns:
+        dict: 분리된 정보 (gen, fuel_type, model_year만)
+    """
+    if not original_name or pd.isna(original_name):
+        return {"gen": None, "fuel_type": None, "model_year": None}
+    
+    result = {"gen": None, "fuel_type": None, "model_year": None}
+    
+    # 분석할 차량명 복사본 생성
+    clean_name = str(original_name).strip()
+    
+    # 1. 세대 정보 추출 (숫자+세대)
+    gen_pattern = r'(\d+세대)'
+    gen_match = re.search(gen_pattern, clean_name)
+    if gen_match:
+        result["gen"] = gen_match.group(1)
+    
+    # 2. 연료 타입 추출
+    fuel_types = ['휘발유', 'LPG', '전기', '경유', '하이브리드', '전기차']
+    for fuel in fuel_types:
+        if fuel in clean_name:
+            result["fuel_type"] = fuel
+            break
+    
+    # 3. 연식 추출 (YYYY 형식)
+    year_patterns = [
+        r'\b(19\d{2}|20\d{2})\b',  # 기본 연도 패턴
+        r'^(19\d{2}|20\d{2})\s+',  # 문자열 시작 부분의 연도
+        r'\s+(19\d{2}|20\d{2})$',  # 문자열 끝 부분의 연도
+        r'(19\d{2}|20\d{2})\s*년',  # 연도 + '년'
+        r'(19\d{2}|20\d{2})\s*년형',  # 연도 + '년형'
+    ]
+    
+    for pattern in year_patterns:
+        year_match = re.search(pattern, clean_name)
+        if year_match:
+            result["model_year"] = year_match.group(1)
+            break
+    
+    return result
+
+def enhance_dataframe_with_parsed_info(df):
+    """
+    DataFrame에 차량명 분석 정보를 추가하는 함수
+    """
+    if df.empty:
+        return df
+    
+    # 차량명 정규화 적용
+    df = normalize_car_names(df)
+    
+    # 각 행에 대해 차량명 분석 정보 추가
+    for idx, row in df.iterrows():
+        original_name = row.get('ORIGINAL_NAME', '')
+        parsed_info = parse_car_name(original_name)
+        
+        # GEN 컬럼 추가 (기존에 없으면)
+        if 'GEN' not in df.columns:
+            df['GEN'] = ''
+        df.loc[idx, 'GEN'] = parsed_info.get('gen', '')
+    
+    # CARNAME_EDIT 컬럼 생성
+    df = create_carname_edit(df)
+    
+    return df
+
+def create_price_comparison_pivot(df):
+    """
+    플랫폼별 가격 비교를 위한 피벗 테이블을 생성하는 함수
+    제주패스의 랭킹, 가격차이, 조정마진 계산 포함
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    # CARNAME_EDIT을 기준으로 그룹화하여 플랫폼별 최저 가격 추출
+    pivot_data = []
+    
+    # CARNAME_EDIT별로 그룹화
+    grouped = df.groupby('CARNAME_EDIT')
+    
+    for carname_edit, group in grouped:
+        # 각 플랫폼별 최저 가격 찾기
+        platform_prices = {}
+        jeju_pass_info = {}  # 제주패스 추가 정보 저장
+        
+        for platform in group['PLATFORM'].unique():
+            platform_data = group[group['PLATFORM'] == platform]
+            if not platform_data.empty:
+                # 최저 가격 행 찾기
+                min_price_idx = platform_data['PRICE'].idxmin()
+                min_price_row = platform_data.loc[min_price_idx]
+                min_price = min_price_row['PRICE']
+                platform_prices[platform] = min_price
+                
+                # 제주패스인 경우 추가 정보 저장 (숫자형으로 안전하게 변환)
+                if platform == '제주패스':
+                    def safe_numeric_convert(value, default=0):
+                        try:
+                            return float(value) if value is not None and str(value).strip() != '' else default
+                        except (ValueError, TypeError):
+                            return default
+                    
+                    jeju_pass_info = {
+                        '제주패스_원가': safe_numeric_convert(min_price_row.get('ORIGIN_PRICE'), 0),
+                        '제주패스_마진': safe_numeric_convert(min_price_row.get('MARGIN'), 0),
+                        '제주패스_마진율': safe_numeric_convert(min_price_row.get('MARGIN_RATE'), 0),
+                        '제주패스_업체코드': str(min_price_row.get('ENTRPS_CODE', '')),
+                        '제주패스_차량코드': str(min_price_row.get('CAR_CODE', ''))
+                    }
+        
+        # 결과 행 생성
+        row = {'차량정보': carname_edit}
+        row.update(platform_prices)
+        row.update(jeju_pass_info)  # 제주패스 추가 정보 포함
+        
+        # 가격 리스트 생성 (제주패스 포함된 경우만)
+        if '제주패스' in platform_prices:
+            prices = list(platform_prices.values())
+            jeju_pass_price = platform_prices['제주패스']
+            
+            # 가격 순으로 정렬하여 순위 매기기
+            sorted_platforms = sorted(platform_prices.items(), key=lambda x: x[1])
+            
+            # 제주패스 순위 찾기
+            jeju_pass_rank = next((i+1 for i, (platform, price) in enumerate(sorted_platforms) if platform == '제주패스'), None)
+            row['RANKING'] = jeju_pass_rank
+            
+            # 기본 정보
+            row['최저가'] = min(prices)
+            row['최고가'] = max(prices)
+            row['가격차이'] = max(prices) - min(prices)
+            
+            # 제주패스 원가 및 마진율 정보 (이미 숫자형으로 변환됨)
+            origin_price = jeju_pass_info.get('제주패스_원가', 0)
+            current_margin_rate = jeju_pass_info.get('제주패스_마진율', 0)
+            
+            # PRICE_COMPARE 및 조정마진 계산
+            if jeju_pass_rank == 1:
+                # 제주패스가 1위인 경우 - 2위와 비교
+                if len(sorted_platforms) >= 2:
+                    second_platform, second_price = sorted_platforms[1]
+                    price_diff = second_price - jeju_pass_price
+                    row['PRICE_COMPARE'] = price_diff
+                    
+                    # 2위와의 차이가 10% 이상인지 확인
+                    if jeju_pass_price > 0:
+                        diff_percentage = (price_diff / jeju_pass_price) * 100
+                        
+                        if diff_percentage >= 10:
+                            # 10% 이상 차이나면 마진을 높일 수 있음
+                            # 새로운 목표 가격: 2위 가격의 95% (5% 정도 낮게)
+                            target_price = second_price * 0.95
+                            if origin_price > 0:
+                                new_margin = target_price - origin_price
+                                new_margin_rate = (new_margin / origin_price) * 100
+                                row['제주패스조정마진'] = round(new_margin_rate, 1)
+                            else:
+                                row['제주패스조정마진'] = current_margin_rate
+                        else:
+                            # 10% 미만 차이면 기존 마진 유지
+                            row['제주패스조정마진'] = current_margin_rate
+                    else:
+                        row['제주패스조정마진'] = current_margin_rate
+                else:
+                    row['PRICE_COMPARE'] = 0
+                    row['제주패스조정마진'] = current_margin_rate
+                    
+            else:
+                # 제주패스가 1위가 아닌 경우 - 1위와 비교
+                first_platform, first_price = sorted_platforms[0]
+                price_diff = first_price - jeju_pass_price  # 음수가 될 것
+                row['PRICE_COMPARE'] = price_diff
+                
+                # 1위가 되기 위한 목표 가격: 1위 가격보다 1% 낮게
+                target_price = first_price * 0.99
+                
+                if origin_price > 0:
+                    # 목표 가격을 달성하기 위한 마진 계산
+                    required_margin = target_price - origin_price
+                    required_margin_rate = (required_margin / origin_price) * 100
+                    
+                    # 마진율이 10% 이하로 떨어지는지 확인
+                    if required_margin_rate <= 10:
+                        # 10% 이하로 떨어지면 기존 마진율 유지
+                        row['제주패스조정마진'] = current_margin_rate
+                    else:
+                        # 10% 초과하면 새로운 마진율 적용
+                        row['제주패스조정마진'] = round(required_margin_rate, 1)
+                else:
+                    row['제주패스조정마진'] = current_margin_rate
+            
+            # 제주패스가 최저가인지 확인
+            if jeju_pass_price == min(prices):
+                row['제주패스_최저가여부'] = 'Y'
+            else:
+                row['제주패스_최저가여부'] = 'N'
+        else:
+            # 제주패스가 없는 경우
+            prices = list(platform_prices.values())
+            if prices:
+                row['최저가'] = min(prices)
+                row['최고가'] = max(prices)
+                row['가격차이'] = max(prices) - min(prices)
+            row['RANKING'] = None
+            row['PRICE_COMPARE'] = None
+            row['제주패스조정마진'] = None
+            row['제주패스_최저가여부'] = 'N'
+        
+        pivot_data.append(row)
+    
+    comparison_df = pd.DataFrame(pivot_data)
+    
+    # 조정마진금액 계산 (기존마진액 - 변경마진액)
+    for idx, row in comparison_df.iterrows():
+        if pd.notna(row.get('제주패스_원가')) and pd.notna(row.get('제주패스_마진율')) and pd.notna(row.get('제주패스조정마진')):
+            origin_price = row['제주패스_원가']
+            current_margin_rate = row['제주패스_마진율']
+            adjusted_margin_rate = row['제주패스조정마진']
+            
+            if origin_price > 0:
+                # 기존 마진액
+                current_margin_amount = origin_price * (current_margin_rate / 100)
+                # 조정 마진액
+                adjusted_margin_amount = origin_price * (adjusted_margin_rate / 100)
+                # 마진 변화액 (기존 - 조정)
+                margin_diff = current_margin_amount - adjusted_margin_amount
+                comparison_df.loc[idx, '조정마진금액'] = round(margin_diff, 0)
+            else:
+                comparison_df.loc[idx, '조정마진금액'] = 0
+        else:
+            comparison_df.loc[idx, '조정마진금액'] = 0
+    
+    # 컬럼 순서 정리 (요청된 순서대로)
+    desired_cols = [
+        '차량정보', '제주패스', '찜카', '카모아', 'RANKING', 'PRICE_COMPARE', 
+        '제주패스_원가', '제주패스_마진', '제주패스_마진율', '제주패스_업체코드', '제주패스_차량코드',
+        '최저가', '최고가', '가격차이', '제주패스_최저가여부', '검색일자', '여행기간', 
+        '제주패스조정마진', '조정마진금액'
+    ]
+    
+    # 돌하루팡 컬럼이 있다면 찜카와 카모아 사이에 추가
+    if '돌하루팡' in comparison_df.columns:
+        # 찜카 다음에 돌하루팡 삽입
+        final_cols = []
+        for col in desired_cols:
+            final_cols.append(col)
+            if col == '찜카':
+                final_cols.append('돌하루팡')
+        desired_cols = final_cols
+    
+    # 존재하는 컬럼만 선택
+    existing_cols = [col for col in desired_cols if col in comparison_df.columns]
+    
+    # 누락된 필수 컬럼이 있다면 추가 (빈 값으로)
+    for col in ['검색일자', '여행기간']:
+        if col not in comparison_df.columns:
+            comparison_df[col] = ''
+            existing_cols.append(col)
+    
+    comparison_df = comparison_df[existing_cols]
+    
+    return comparison_df
+
+def normalize_car_names(df):
+    """
+    차량명을 표준화하는 함수 - ORIGINAL_NAME 기준으로 처리하되, 없으면 CAR_NAME 사용
+    """
+    if df.empty:
+        return df
+    
+    # ORIGINAL_NAME이 없으면 CAR_NAME을 ORIGINAL_NAME으로 복사
+    if 'ORIGINAL_NAME' not in df.columns:
+        if 'CAR_NAME' in df.columns:
+            df['ORIGINAL_NAME'] = df['CAR_NAME'].copy()
+        else:
+            return df
+    
+    # MODEL_YEAR를 정수로 변환 (안전하게)
+    def safe_int_conversion(year_value):
+        try:
+            if pd.isna(year_value) or year_value == '' or year_value is None:
+                return None
+            return int(float(str(year_value)))
+        except (ValueError, TypeError):
+            return None
+    
+    for idx, row in df.iterrows():
+        # ORIGINAL_NAME을 기준으로 정규화 적용 (없으면 CAR_NAME 사용)
+        name_for_analysis = row.get('ORIGINAL_NAME') or row.get('CAR_NAME', '')
+        original_name = str(name_for_analysis).strip().lower() if pd.notna(name_for_analysis) else ''
+        model_year = safe_int_conversion(row.get('MODEL_YEAR', None))
+        
+        # 정규화 적용 전에 차량명이 매칭되는지 확인
+        car_matched = False
+        
+        # 1. 그랜저 처리
+        if '그랜저' in original_name:
+            if model_year and model_year <= 2020:
+                df.loc[idx, 'CAR_NAME'] = '그랜저IG'
+            elif model_year and model_year >= 2021:
+                df.loc[idx, 'CAR_NAME'] = '그랜저GN7'
+            else:
+                df.loc[idx, 'CAR_NAME'] = '그랜저'
+            car_matched = True
+        
+        # 2. 스타렉스 처리
+        elif '스타렉스' in original_name:
+            if '교통약자' in original_name and '리프트' in original_name:
+                df.loc[idx, 'CAR_NAME'] = name_for_analysis  # 그대로 유지
+            else:
+                df.loc[idx, 'CAR_NAME'] = '그랜드스타렉스'
+            car_matched = True
+        
+        # 3. K5 처리
+        elif 'k5' in original_name:
+            df.loc[idx, 'CAR_NAME'] = 'K5'
+            car_matched = True
+        
+        # 4. K3 처리
+        elif 'k3' in original_name:
+            if model_year and model_year <= 2021:
+                df.loc[idx, 'CAR_NAME'] = '올 뉴 K3'
+            elif model_year and model_year >= 2022:
+                df.loc[idx, 'CAR_NAME'] = '더 뉴 K3'
+            else:
+                df.loc[idx, 'CAR_NAME'] = 'K3'
+            car_matched = True
+        
+        # 5. K7 처리
+        elif 'k7' in original_name:
+            df.loc[idx, 'CAR_NAME'] = 'K7'
+            car_matched = True
+        
+        # 6. K8 처리
+        elif 'k8' in original_name:
+            df.loc[idx, 'CAR_NAME'] = 'K8'
+            car_matched = True
+        
+        # 7. K9 처리
+        elif 'k9' in original_name:
+            df.loc[idx, 'CAR_NAME'] = 'K9'
+            car_matched = True
+        
+        # 8. 니로 처리
+        elif '니로' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '니로'
+            car_matched = True
+        
+        # 9. 미니 처리
+        elif '미니' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '미니쿠퍼'
+            car_matched = True
+
+        # 10. 투싼 처리
+        elif '투싼' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '투싼'
+            car_matched = True
+
+        # 11. 팰리세이드 처리
+        elif '팰리세이드' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '팰리세이드'
+            car_matched = True
+            
+        # 12. 머스탱 처리
+        elif '머스탱' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '머스탱'
+            car_matched = True
+
+        # 13. 쏘나타 처리
+        elif '쏘나타' in original_name:
+            if model_year and model_year <= 2023:
+                df.loc[idx, 'CAR_NAME'] = '쏘나타 DN8'
+            elif model_year and model_year >= 2024:
+                df.loc[idx, 'CAR_NAME'] = '쏘나타 엣지'
+            else:
+                df.loc[idx, 'CAR_NAME'] = '쏘나타'
+            car_matched = True
+
+        # 14. 아반떼 처리 (아반뗴, 아반테 등도 포함)
+        elif '아반떼' in original_name or '아반뗴' in original_name or '아반테' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '아반떼'
+            car_matched = True
+
+        # 15. 코란도 처리
+        elif '코란도' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '코란도'
+            car_matched = True
+
+        # 16. 아이오닉5 처리
+        elif '아이오닉5' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '아이오닉5'
+            car_matched = True
+
+        # 17. 아이오닉6 처리
+        elif '아이오닉6' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '아이오닉6'
+            car_matched = True
+
+        # 18. 셀토스 처리
+        elif '셀토스' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '셀토스'
+            car_matched = True
+
+        # 19. 레이 처리
+        elif '레이' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '레이'
+            car_matched = True
+
+        # 20. 벤츠 처리
+        elif '벤츠' in original_name:
+           if 'e' in original_name and '클래스' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '벤츠 E250'
+           elif 'e250' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '벤츠 E250'
+           elif 'c' in original_name and '클래스' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '벤츠 C200'
+           else:
+               df.loc[idx, 'CAR_NAME'] = '벤츠'
+           car_matched = True
+
+        # 21. BMW 처리
+        elif 'bmw' in original_name:
+           if '420i' in original_name:
+               df.loc[idx, 'CAR_NAME'] = 'BMW 4 시리즈'
+           elif '430i' in original_name:
+               df.loc[idx, 'CAR_NAME'] = 'BMW 4 시리즈'
+           elif '520i' in original_name:
+               df.loc[idx, 'CAR_NAME'] = 'BMW 5 시리즈'
+           elif '530i' in original_name:
+               df.loc[idx, 'CAR_NAME'] = 'BMW 5 시리즈'
+           else:
+               df.loc[idx, 'CAR_NAME'] = '벤츠'
+           car_matched = True
+
+        # 22. 싼타페 처리
+        elif '싼타페' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '싼타페'
+            car_matched = True
+
+        # 23. 모닝 처리
+        elif '모닝' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '모닝'
+            car_matched = True
+
+        # 24. 제네시스 처리
+        elif '제네시스' in original_name or 'gv' in original_name or 'g70' in original_name or 'g80' in original_name or 'g90' in original_name:
+           if 'g80' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '제네시스 G80'
+           elif 'g90' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '제네시스 G90'
+           elif 'gv60' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '제네시스 GV60'
+           elif 'gv70' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '제네시스 GV70'
+           elif 'gv80' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '제네시스 GV80'
+           elif 'g70' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '제네시스 G70'
+           else:
+               df.loc[idx, 'CAR_NAME'] = '제네시스'
+           car_matched = True
+
+        # 25. 카니발 처리
+        elif '카니발' in original_name:
+            if '하이리무진' in original_name:
+                df.loc[idx, 'CAR_NAME'] = '카니발 하이리무진'
+            elif '리무진' in original_name:
+                df.loc[idx, 'CAR_NAME'] = '카니발 리무진'
+            else:
+                df.loc[idx, 'CAR_NAME'] = '카니발'
+            car_matched = True
+
+        # 26. 코나 처리
+        elif '코나' in original_name:
+           if '롱레인지' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '코나 롱레인지'
+           else: 
+               df.loc[idx, 'CAR_NAME'] = '코나'
+           car_matched = True
+
+        # 27. 스타리아 처리
+        elif '스타리아' in original_name:
+           if '투어러' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '스타리아투어러'
+           elif '라운지' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '스타리아라운지'
+           else: 
+               df.loc[idx, 'CAR_NAME'] = '스타리아'
+           car_matched = True
+               
+        # 28. 볼보 처리
+        elif '볼보' in original_name:
+           if 'xc40' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '볼보 XC40'
+           elif 'xc60' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '볼보 XC60'
+           elif 's90' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '볼보 S90' 
+           elif 'c40' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '볼보 C40'    
+           else: 
+               df.loc[idx, 'CAR_NAME'] = '볼보'
+           car_matched = True
+
+        # 29. 지프 처리
+        elif '지프' in original_name or 'jeep' in original_name:
+               df.loc[idx, 'CAR_NAME'] = '지프랭글러'
+               car_matched = True
+
+        # 30. 기타 차량들
+        elif '모하비' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '모하비'
+            car_matched = True
+        elif '캐스퍼' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '캐스퍼'
+            car_matched = True
+        elif '베뉴' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '베뉴'
+            car_matched = True
+        elif '이티밴' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '이티밴'
+            car_matched = True
+        elif '쏘렌토' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '쏘렌토'
+            car_matched = True
+        elif 'ev9' in original_name:
+            df.loc[idx, 'CAR_NAME'] = 'EV9'
+            car_matched = True
+        elif 'ev6' in original_name:
+            df.loc[idx, 'CAR_NAME'] = 'EV6'
+            car_matched = True
+        elif 'ev5' in original_name:
+            df.loc[idx, 'CAR_NAME'] = 'EV5'
+            car_matched = True
+        elif 'ev3' in original_name:
+            df.loc[idx, 'CAR_NAME'] = 'EV3'
+            car_matched = True
+        elif '폴스타' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '폴스타'
+            car_matched = True
+        elif '스포티지' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '스포티지'
+            car_matched = True
+        elif '말리부' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '말리부'
+            car_matched = True
+        elif '티볼리' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '티볼리'
+            car_matched = True
+        elif '쏘울' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '쏘울'
+            car_matched = True
+        elif '쏠라티' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '쏠라티'
+            car_matched = True
+        elif '아우디' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '아우디A5'
+            car_matched = True
+        elif '트랙스' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '트랙스'
+            car_matched = True
+        elif 'MASTER' in original_name:
+            df.loc[idx, 'CAR_NAME'] = '마스터'
+            car_matched = True
+
+        # 매칭되지 않은 경우, 원본명에서 차량명만 추출 시도
+        if not car_matched:
+            # 원본명에서 첫 번째 단어 또는 주요 차량명 추출
+            cleaned_name = re.sub(r'\d{4}', '', name_for_analysis)  # 연도 제거
+            cleaned_name = re.sub(r'(휘발유|경유|LPG|전기|하이브리드)', '', cleaned_name)  # 연료 제거
+            cleaned_name = re.sub(r'[-\s]+', ' ', cleaned_name).strip()  # 특수문자 정리
+            
+            # 첫 번째 의미있는 단어 추출
+            words = cleaned_name.split()
+            if words:
+                df.loc[idx, 'CAR_NAME'] = words[0]
+            else:
+                df.loc[idx, 'CAR_NAME'] = name_for_analysis
+
+    return df
+
+def create_carname_edit(df):
+    """
+    CARNAME_EDIT 컬럼을 생성하는 함수 (vendor-car_name-fuel_type-model_year 형식)
+    중복 정보 제거 및 정리된 형식으로 생성
+    """
+    if df.empty:
+        return df
+    
+    carname_edit_values = []
+    
+    for idx, row in df.iterrows():
+        # 각 필드 값 가져오기 (빈 값 처리)
+        vendor = str(row.get('VENDOR', '')).strip() if pd.notna(row.get('VENDOR')) else ''
+        car_name = str(row.get('CAR_NAME', '')).strip() if pd.notna(row.get('CAR_NAME')) else ''
+        fuel_type = str(row.get('FUEL_TYPE', '')).strip() if pd.notna(row.get('FUEL_TYPE')) else ''
+        model_year = str(row.get('MODEL_YEAR', '')).strip() if pd.notna(row.get('MODEL_YEAR')) else ''
+        
+        # MODEL_YEAR에서 숫자만 추출 (2022.0 -> 2022)
+        if model_year and '.' in model_year:
+            model_year = model_year.split('.')[0]
+        
+        # FUEL_TYPE 정리 (중복 제거 및 표준화)
+        if fuel_type:
+            # 중복된 연료타입 정리
+            fuel_parts = fuel_type.split()
+            unique_fuel_parts = []
+            for part in fuel_parts:
+                if part not in unique_fuel_parts:
+                    unique_fuel_parts.append(part)
+            fuel_type = ' '.join(unique_fuel_parts)
+        
+        # CAR_NAME에서 이미 포함된 정보 제거
+        clean_car_name = car_name
+        if fuel_type and fuel_type in clean_car_name:
+            clean_car_name = clean_car_name.replace(fuel_type, '').strip()
+        if model_year and model_year in clean_car_name:
+            clean_car_name = clean_car_name.replace(model_year, '').strip()
+        
+        # 연속된 공백과 특수문자 정리
+        clean_car_name = re.sub(r'[-\s]+', ' ', clean_car_name).strip()
+        clean_car_name = clean_car_name.strip('- ')
+        
+        # 하이픈으로 연결 (빈 값은 빈 문자열로)
+        carname_edit = f"{vendor}-{clean_car_name}-{fuel_type}-{model_year}"
+        carname_edit_values.append(carname_edit)
+    
+    # CARNAME_EDIT 컬럼 추가
+    df['CARNAME_EDIT'] = carname_edit_values
+    
+    return df
+
+# 카모아 데이터 수집 클래스
+class CarmoreDataCollector:
+    def __init__(self):
+        self.base_url = "https://core-api.carmore.kr/home/php/get/selfInventory.php"
+        self.access_key = "AQICAHiCazvFxlGr2sXV6w52iLClhCQm2naK0tiVSmfXheMp7gHV9V+irgoWM07TKeGCB+8OAAAAejB4BgkqhkiG9w0BBwagazBpAgEAMGQGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMLSVEO6oY3vOKEHeEAgEQgDdL+h90RYT2gKxANK4BnZUOGsfZZuKM6bxmquQqxuziTZ0Kr3vMEo2nyjJIxm8qOyNvfQp7MwQV"
+        
+        # 세션 생성 (쿠키 및 세션 유지)
+        self.session = requests.Session()
+        
+        # 헤더 설정 (실제 브라우저 요청과 유사하게)
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': 'https://carmore.kr/home/page-car-list-depth2.html',
+            'Origin': 'https://carmore.kr',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-site'
+        }
+        
+        # 세션에 헤더 설정
+        self.session.headers.update(self.headers)
+        
+        # 초기 페이지 방문으로 세션 설정
+        self.init_session()
+    
+    def init_session(self):
+        """세션 초기화 - 메인 페이지 방문으로 쿠키 설정"""
+        try:
+            init_url = "https://carmore.kr/home/page-car-list-depth2.html"
+            response = self.session.get(init_url, timeout=10)
+            time.sleep(2)  # 잠시 대기
+        except Exception as e:
+            print(f"카모아 세션 초기화 실패: {e}")
+    
+    def get_car_data(self, start_date, start_time, end_date, end_time, area_code="Q_1", special_location_serial="5"):
+        """
+        렌터카 데이터를 조회합니다.
+        """
+        
+        # POST 방식으로 시도
+        data = {
+            "accessKey": self.access_key,
+            "rentStartDate": f"{start_date} {start_time}",
+            "rentEndDate": f"{end_date} {end_time}",
+            "areaCode": area_code,
+            "filterDriverAge": "-1",
+            "filterCostRange[min]": "-1",
+            "filterCostRange[max]": "-1",
+            "filterCartype[]": "-1",
+            "filterFuel[]": "-1",
+            "specialLocationSerial": special_location_serial,
+        }
+        
+        # GET 방식으로도 시도할 params
+        params = data.copy()
+        
+        try:
+            # 방법 1: POST 요청
+            response = self.session.post(self.base_url, data=data, timeout=30)
+            
+            # POST가 실패하면 GET 시도
+            if response.status_code != 200:
+                response = self.session.get(self.base_url, params=params, timeout=30)
+            
+            if response.status_code == 200:
+                try:
+                    data_json = response.json()
+                    return data_json
+                    
+                except json.JSONDecodeError as e:
+                    print(f"카모아 JSON 파싱 오류: {e}")
+                    return None
+            else:
+                print(f"카모아 HTTP 오류: {response.status_code}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"카모아 HTTP 요청 오류: {e}")
+            return None
+    
+    def extract_car_info(self, api_data, debug=False):
+        """
+        API 응답에서 차량 정보를 추출합니다.
+        """
+        if not api_data or api_data.get('result') != 1:
+            return []
+        
+        # 연료 타입 매핑
+        fuel_type_mapping = {
+            1: '휘발유',
+            2: '경유',
+            3: 'LPG',
+            4: '전기',
+            5: '하이브리드',
+            '1': '휘발유',
+            '2': '경유',
+            '3': 'LPG',
+            '4': '전기',
+            '5': '하이브리드'
+        }
+        
+        extracted_data = []
+        car_list = api_data.get('carList', [])
+        
+        for i, car_group in enumerate(car_list):
+            # carModel 정보 - bottomCarInfo에서 가져오기
+            car_model = ""
+            if 'bottomCarInfo' in car_group:
+                car_model = car_group['bottomCarInfo'].get('carModel', '')
+            if not car_model and 'topCarInfo' in car_group:
+                car_model = car_group['topCarInfo'].get('topCarName', '')
+            
+            car_info_list = car_group.get('list', [])
+            
+            for j, car_info in enumerate(car_info_list):
+                company_name = clean_vendor_name(car_info.get('companyName', ''))
+                cars = car_info.get('cars', [])
+                
+                for k, car in enumerate(cars):
+                    # 실제 구조에 맞게 데이터 추출
+                    if car.get('price') is not None:
+                        # 기본 가격
+                        base_price = car.get('price', 0)
+                        
+                        # CDW 보험료 찾기 (carmoreCdwName: 2인 항목)
+                        cdw_fee = 0
+                        cdw_list = car.get('cdw', [])
+                        if isinstance(cdw_list, list):
+                            for cdw_item in cdw_list:
+                                if isinstance(cdw_item, dict) and cdw_item.get('carmoreCdwName') == 2:
+                                    cdw_fee = cdw_item.get('insuFee', 0)
+                                    break
+                        
+                        # 최종 가격 = 기본 가격 + CDW 보험료
+                        final_price = base_price + cdw_fee
+                        
+                        # 연료 타입 변환
+                        fuel_code = car.get('fuel', '')
+                        fuel_type = fuel_type_mapping.get(fuel_code, fuel_code)  # 매핑되지 않으면 원본 값 사용
+                        
+                        # 데이터 추출 - CAR_NAME을 원본명으로 초기 설정
+                        row_data = {
+                            'VENDOR': company_name,
+                            'CAR_NAME': car_model,  # 일단 원본명으로 설정
+                            'PRICE': final_price,  # CDW 보험료가 포함된 최종 가격
+                            'FUEL_TYPE': fuel_type,
+                            'MODEL_YEAR': car.get('minYear', ''),
+                            'CAPACITY': car.get('count', 0),
+                            'PLATFORM': '카모아',
+                            'ORIGINAL_NAME': car_model,  # 정규화 기준이 되는 원본명
+                            'ORIGIN_PRICE': car.get('standardPrice', 0),
+                            'BASE_PRICE': base_price,  # 기본 가격 (보험료 제외)
+                            'CDW_FEE': cdw_fee,  # CDW 보험료
+                            'MARGIN': 0,
+                            'MARGIN_RATE': None
+                        }
+                        
+                        if debug:
+                            print(f"차량: {car_model}, 기본가격: {base_price}, CDW보험료: {cdw_fee}, 최종가격: {final_price}")
+                        
+                        extracted_data.append(row_data)
+        
+        return extracted_data
+
+def fetch_carmore_data(start_date, start_time, end_date, end_time):
+    """
+    카모아에서 렌터카 데이터를 조회하여 DataFrame으로 반환
+    """
+    print(f"⏳ 카모아: {start_date} {start_time}~{end_date} {end_time}")
+    
+    try:
+        collector = CarmoreDataCollector()
+        
+        # API 호출
+        api_data = collector.get_car_data(start_date, start_time, end_date, end_time)
+        
+        if api_data:
+            extracted_data = collector.extract_car_info(api_data)
+            df = pd.DataFrame(extracted_data)
+            
+            # 가격 숫자 형식으로 변환
+            if not df.empty and "PRICE" in df.columns:
+                df["PRICE"] = pd.to_numeric(df["PRICE"], errors="coerce").fillna(0).astype(int)
+                df["BASE_PRICE"] = pd.to_numeric(df["BASE_PRICE"], errors="coerce").fillna(0).astype(int)
+                df["CDW_FEE"] = pd.to_numeric(df["CDW_FEE"], errors="coerce").fillna(0).astype(int)
+            
+            # 차량명 분석 추가
+            df = enhance_dataframe_with_parsed_info(df)
+            
+            print(f"✅ 카모아 수집: {len(df)}건")
+            return df
+        else:
+            print("🚫 카모아: 데이터 수집 실패")
+            return pd.DataFrame()
+            
+    except Exception as e:
+        print(f"🚫 카모아 오류: {e}")
+        return pd.DataFrame()
+
+def fetch_jeju_pass_filtered(bd, bt, ed, et):
+    """
+    제주패스에서 렌트카 검색 결과를 가져와 데이터프레임으로 변환합니다.
+    """
+    print(f"⏳ 제주패스: {bd} {bt}~{ed} {et}")
+    url = "https://api.jejupass.com/external/api/rentcar/v3/searchList"
+    params = {
+        "resveBeginDe": bd, "resveBeginTime": bt,
+        "resveEndDe": ed, "resveEndTime": et,
+        "driverYearLmtYn": "N", "driverYearLmt": 30,
+        "driverLicenseYear": 3, "insrncApplcCode": "03",
+        "rand": "Dk5CfEIE", "vhctySeCode": "01,02,03,04,05,06,07,08,09",
+        "vhcleCodes": "", "tagCodes": "", "masterCodes": "", "compData": ""
+    }
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        
+        data = r.json().get("data", {})
+        
+        if not data:
+            print("⚠️ 제주패스: API 응답에 data 키가 없습니다.")
+            return pd.DataFrame()
+            
+        lst = data.get("revSearchList") or data.get("ilsoftSearchList") or []
+        
+        if not lst:
+            print("⚠️ 제주패스: API 응답에 검색 결과가 없습니다.")
+            return pd.DataFrame()
+        
+        out = []
+        for it in lst:
+            seat_count = it.get("tkcarNmpr", "")
+            srvcNm = it.get("srvcNm", "")
+            fuel = it.get("fuelNm", "")
+            year = next((part[:4] for part in srvcNm.split(',') if part[:4].isdigit()), None)
+            
+            item_list = it.get("itemList", [])
+            if not item_list:
+                continue
+            
+            for itm in item_list:
+                # 원본 차량명 가져오기
+                original_car_name = itm.get("vhcleNm", "")              
+                # 렌터카사 이름변경
+                comp = clean_vendor_name(itm.get("entrpsExpsrNm", ""))
+                
+                price = itm.get("discountPrice", "")
+                if not price:
+                    continue
+                    
+                # 데이터 저장 - CAR_NAME을 원본명으로 초기 설정
+                out.append({
+                    "VENDOR": comp,
+                    "CAR_NAME": original_car_name,  # 일단 원본명으로 설정
+                    "PRICE": price,
+                    "FUEL_TYPE": fuel,
+                    "MODEL_YEAR": year,
+                    "CAPACITY": seat_count,
+                    "ORIGIN_PRICE": itm.get("originDiscountPrice"),
+                    "CAR_CODE": itm.get("code"),
+                    "ENTRPS_CODE": itm.get("entrpsSn"),
+                    "MARGIN": itm.get("flexiblePrice", ""),
+                    "MARGIN_RATE": itm.get("upSaleAry", ""),
+                    "PLATFORM": "제주패스",
+                    "ORIGINAL_NAME": original_car_name  # 정규화 기준이 되는 원본명
+                })
+        
+        df = pd.DataFrame(out)
+        
+        if df.empty:
+            print("⚠️ 제주패스: 최종 데이터프레임이 비어 있습니다.")
+            return df
+            
+        # 숫자 형식 변환
+        if "PRICE" in df.columns:
+            df["PRICE"] = pd.to_numeric(df["PRICE"], errors="coerce").fillna(0).astype(int)
+        
+        # 차량명 분석 추가
+        df = enhance_dataframe_with_parsed_info(df)
+        
+        print(f"✅ 제주패스 수집: {len(df)}건")
+        return df
+    
+    except Exception as e:
+        print(f"🚫 제주패스 오류: {e}")
+        return pd.DataFrame()
+
+def get_cookies_from_browser():
+    # TODO: Selenium으로 브라우저 쿠키를 가져오는 로직 구현
+    return ""
+
+def fetch_dolharupang_data(sd, st, ed, et):
+    print(f"⏳ 돌하루팡: {sd} {st}~{ed} {et}")
+    url = "https://www.dolharupang.com/rest/open/api/cars"
+    params = {
+        "startDate": f"{sd} {st}",
+        "endDate": f"{ed} {et}",
+        "kwdId": "gg", "type": "car", "insurType[]": [2]
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.dolharupang.com/",
+        "X-Requested-With": "XMLHttpRequest",
+        "Cookie": get_cookies_from_browser()
+    }
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.json() if isinstance(r.json(), dict) else json.loads(r.text)
+    except Exception as e:
+        print("🚫 돌하루팡 오류:", e)
+        return {}
+
+def process_dolharupang_data(data):
+    if not isinstance(data, dict):
+        return pd.DataFrame()
+    
+    car_data = data.get("data", {})
+    out, cnt, tot = [], 0, 0
+    
+    def extract_year_from_any_field(package_name, make_year_info):
+        """여러 필드에서 연도를 찾아 추출"""
+        import re
+        
+        # 1. makeYearInfo에서 먼저 시도
+        if make_year_info:
+            if isinstance(make_year_info, str):
+                year_match = re.search(r'\b(19\d{2}|20\d{2})\b', make_year_info)
+                if year_match:
+                    return year_match.group(1)
+            elif isinstance(make_year_info, (int, float)):
+                year_str = str(int(make_year_info))
+                if len(year_str) == 4 and year_str.startswith(('19', '20')):
+                    return year_str
+        
+        # 2. packageNmTmpl에서 시도
+        if package_name:
+            year_match = re.search(r'\b(19\d{2}|20\d{2})\b', str(package_name))
+            if year_match:
+                return year_match.group(1)
+        
+        return ""
+    
+    def extract_fuel_type_from_packageNmTmpl(package_name):
+        """packageNmTmpl에서 연료 타입 추출"""
+        if not package_name:
+            return ""
+        
+        # 연료 타입 키워드 정의 (우선순위 순서로 배치)
+        fuel_keywords = [
+            ('하이브리드', '하이브리드'),
+            ('전기', '전기'),
+            ('경유', '경유'),
+            ('휘발유', '휘발유'),
+            ('LPG', 'LPG'),
+            ('lpg', 'LPG'),  # 소문자도 처리
+        ]
+        
+        package_name_str = str(package_name)
+        
+        # 각 연료 타입 키워드를 확인
+        for keyword, fuel_type in fuel_keywords:
+            if keyword in package_name_str:
+                return fuel_type
+        
+        return ""
+    
+    def extract_car_name_from_packageNmTmpl(package_name):
+        """packageNmTmpl에서 실제 차량명만 추출"""
+        if not package_name:
+            return ""
+        
+        # 차량명 매핑 딕셔너리 (packageNmTmpl에서 실제 차량명으로)
+        car_mapping = {
+            # 기아차
+            '모닝': '모닝', 'K3': 'K3', 'K5': 'K5', 'K7': 'K7', 'K8': 'K8', 'K9': 'K9',
+            '니로': '니로', '셀토스': '셀토스', '쏘렌토': '쏘렌토', '쏘울': '쏘울', 
+            '스포티지': '스포티지', '카니발': '카니발', '모하비': '모하비',
+            'EV6': 'EV6', 'EV9': 'EV9', 'EV5': 'EV5', 'EV3': 'EV3',
+            
+            # 현대차
+            '아반떼': '아반떼', '쏘나타': '쏘나타', '그랜저': '그랜저',
+            '투싼': '투싼', '싼타페': '싼타페', '팰리세이드': '팰리세이드',
+            '코나': '코나', '베뉴': '베뉴', '캐스퍼': '캐스퍼', '레이': '레이',
+            '아이오닉5': '아이오닉5', '아이오닉6': '아이오닉6',
+            '스타리아': '스타리아', '스타렉스': '그랜드스타렉스',
+            
+            # 제네시스
+            'G70': '제네시스 G70', 'G80': '제네시스 G80', 'G90': '제네시스 G90',
+            'GV60': '제네시스 GV60', 'GV70': '제네시스 GV70', 'GV80': '제네시스 GV80',
+            '제네시스': '제네시스',
+            
+            # 쌍용차
+            '코란도': '코란도', '티볼리': '티볼리', '쏠라티': '쏠라티',
+            
+            # 수입차
+            '벤츠': '벤츠', 'BMW': 'BMW', '아우디': '아우디', '볼보': '볼보',
+            '미니': '미니쿠퍼', '지프': '지프랭글러', '폴스타': '폴스타',
+            '머스탱': '머스탱', '말리부': '말리부', '트랙스': '트랙스',
+            'MASTER': '마스터'
+        }
+        
+        package_str = str(package_name).strip()
+        
+        # 매핑된 차량명 찾기 (긴 이름부터 우선 매칭)
+        sorted_mapping = sorted(car_mapping.items(), key=lambda x: len(x[0]), reverse=True)
+        for key, value in sorted_mapping:
+            if key in package_str:
+                return value
+        
+        # 매핑되지 않은 경우, 첫 번째 단어 추출
+        if ',' in package_str:
+            first_part = package_str.split(',')[0].strip()
+        else:
+            words = package_str.split()
+            first_part = words[0] if words else package_str
+        
+        return first_part if first_part else "기타"
+    
+    # 디버깅을 위한 로그 추가
+    if isinstance(car_data, list) and len(car_data) > 0:
+        print("🔍 돌하루팡 첫 번째 아이템 구조:")
+        first_item = car_data[0]
+        print(f"  keys: {list(first_item.keys())}")
+        print(f"  makeYearInfo: '{first_item.get('makeYearInfo')}'")
+        print(f"  packageNmTmpl: '{first_item.get('packageNmTmpl')}'")
+    
+    # car_data가 리스트인 경우와 딕셔너리인 경우를 모두 처리
+    if isinstance(car_data, list):
+        # 리스트 형태의 응답 처리
+        for item in car_data:
+            if not isinstance(item, dict):
+                continue
+            
+            tot += 1
+            
+            # 각 아이템에서 필요한 정보 추출
+            package_name = item.get("packageNmTmpl") or item.get("carName") or item.get("name", "")
+            vendor = item.get("companyName") or item.get("vendor", "")
+            price = item.get("priceTotal") or item.get("price", 0)
+            capacity = item.get("capacityUser") or item.get("capacity", "")
+            
+            # 실제 차량명 추출
+            car_name = extract_car_name_from_packageNmTmpl(package_name)
+            
+            # makeYearInfo에서 연도 추출
+            make_year_info = item.get("makeYearInfo", "")
+            model_year = extract_year_from_any_field(package_name, make_year_info)
+            
+            # packageNmTmpl에서 연료 타입 추출
+            fuel_type = extract_fuel_type_from_packageNmTmpl(package_name)
+            
+            # 디버깅: 연도 추출 확인 (처음 3개만)
+            if cnt < 3:
+                print(f"  🔍 연도 추출 #{cnt+1}: makeYearInfo='{make_year_info}' → model_year='{model_year}'")
+                print(f"  🔍 차량명 추출 #{cnt+1}: packageNmTmpl='{package_name}' → car_name='{car_name}'")
+                print(f"  🔍 연료 추출 #{cnt+1}: fuel_type='{fuel_type}'")
+            
+            # 가격이 유효한지 확인
+            if not price or price == 0:
+                continue
+            
+            cnt += 1
+            vendor_clean = clean_vendor_name(str(vendor))
+            
+            out.append({
+                "VENDOR": vendor_clean,
+                "CAR_NAME": car_name,  # 추출된 실제 차량명
+                "PRICE": price,
+                "FUEL_TYPE": fuel_type,  # packageNmTmpl에서 추출한 연료 타입
+                "MODEL_YEAR": model_year,  # makeYearInfo에서 추출한 연도
+                "CAPACITY": capacity,
+                "PLATFORM": "돌하루팡",
+                "ORIGINAL_NAME": package_name,  # 원본 packageNmTmpl 유지
+                "ORIGIN_PRICE": None,
+                "MARGIN": None,
+                "MARGIN_RATE": None
+            })
+    
+    elif isinstance(car_data, dict):
+        # 기존 딕셔너리 형태의 응답 처리
+        for pkg, info in car_data.items():
+            deals = info.get("dealList", {})
+            if not deals:
+                continue
+            for comp, d in deals.items():
+                tot += 1
+                valid_price = None
+                # 완전자차 & 26세 필터
+                for deal in d.get("deals", [d]):
+                    if deal.get("insurType") == "완전자차" and int(deal.get("availableAge", 0)) == 26:
+                        valid_price = deal.get("priceTotal")
+                        break
+                if valid_price is None:
+                    continue
+                cnt += 1
+                comp2 = clean_vendor_name(comp)
+                package_name = info.get("packageNmTmpl", "")
+                
+                # 실제 차량명 추출
+                car_name = extract_car_name_from_packageNmTmpl(package_name)
+                
+                # makeYearInfo에서 연도 추출 (딕셔너리 형태에서도)
+                make_year_info = info.get("makeYearInfo", "")
+                model_year = extract_year_from_any_field(package_name, make_year_info)
+                
+                # packageNmTmpl에서 연료 타입 추출
+                fuel_type = extract_fuel_type_from_packageNmTmpl(package_name)
+                
+                out.append({
+                    "VENDOR": comp2,
+                    "CAR_NAME": car_name,  # 추출된 실제 차량명
+                    "PRICE": valid_price,
+                    "FUEL_TYPE": fuel_type,  # packageNmTmpl에서 추출한 연료 타입
+                    "MODEL_YEAR": model_year,  # makeYearInfo에서 추출한 연도
+                    "CAPACITY": info.get("capacityUser", ""),
+                    "PLATFORM": "돌하루팡",
+                    "ORIGINAL_NAME": package_name,  # 원본 packageNmTmpl 유지
+                    "ORIGIN_PRICE": None,
+                    "MARGIN": None,
+                    "MARGIN_RATE": None
+                })
+    
+    df = pd.DataFrame(out)
+    if not df.empty:
+        df["PRICE"] = pd.to_numeric(df["PRICE"], errors="coerce").fillna(0).astype(int)
+        # 차량명 분석 추가
+        df = enhance_dataframe_with_parsed_info(df)
+    print(f"✅ 돌하루팡 수집: {len(df)} ({cnt}/{tot})")
+    return df
+    
+def fetch_zzimcar_data(start_date, start_time, end_date, end_time):
+    """
+    찜카 렌터카 데이터를 수집하는 함수
+    """
+    print(f"⏳ 찜카: {start_date} {start_time}~{end_date} {end_time}")
+    
+    # URL 형식으로 변환
+    sdate = f"{start_date}T{start_time}"
+    edate = f"{end_date}T{end_time}"
+    
+    # 메인 페이지 URL
+    main_url = f"https://rent-car.zzimcar.com/search/list?sdate={sdate}&edate={edate}&zone=JEJU&bohum=full"
+    
+    session = requests.Session()
+    
+    # 브라우저처럼 보이게 하는 헤더 설정
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Cache-Control': 'max-age=0'
+    }
+    
+    try:
+        # 메인 페이지 접속
+        main_response = session.get(main_url, headers=headers, timeout=30)
+        
+        if main_response.status_code != 200:
+            print(f"🚫 찜카 메인 페이지 접속 실패: {main_response.status_code}")
+            return pd.DataFrame()
+        
+        # API 호출을 위한 헤더 설정 (AJAX 요청용)
+        api_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': main_url,
+            'Origin': 'https://rent-car.zzimcar.com',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        # API URL 설정
+        api_url = "https://nm-api.io/api/internal/v1/car/list"
+        
+        # POST 데이터
+        post_data = {
+            'sdate': sdate,
+            'edate': edate,
+            'zone': 'JEJU',
+            'bohum': 'full'
+        }
+        
+        # POST 요청으로 시도
+        api_response = session.post(api_url, headers=api_headers, json=post_data, timeout=30)
+        
+        # POST가 실패하면 GET으로 다시 시도
+        if api_response.status_code != 200:
+            params = {
+                'sdate': sdate,
+                'edate': edate,
+                'zone': 'JEJU',
+                'bohum': 'full'
+            }
+            api_response = session.get(api_url, headers=api_headers, params=params, timeout=30)
+            
+        # 둘 다 실패하면 다른 형식으로 시도
+        if api_response.status_code != 200:
+            # Content-Type을 form-data로 변경
+            api_headers_form = api_headers.copy()
+            api_headers_form['Content-Type'] = 'application/x-www-form-urlencoded'
+            api_response = session.post(api_url, headers=api_headers_form, data=post_data, timeout=30)
+            
+        # 마지막으로 query string으로 시도
+        if api_response.status_code != 200:
+            query_url = f"{api_url}?sdate={sdate}&edate={edate}&zone=JEJU&bohum=full"
+            api_response = session.get(query_url, headers=api_headers, timeout=30)
+        
+        # 모든 방법이 실패한 경우
+        if api_response.status_code != 200:
+            print(f"🚫 찜카 API 호출 실패: {api_response.status_code}")
+            
+            # 대안 엔드포인트 시도
+            alternative_endpoints = [
+                "https://nm-api.io/api/v1/car/list",
+                "https://nm-api.io/api/car/list", 
+                "https://nm-api.io/car/list",
+                "https://rent-car.zzimcar.com/api/car/list"
+            ]
+            
+            for alt_url in alternative_endpoints:
+                try:
+                    alt_response = session.get(alt_url, headers=api_headers, params={'sdate': sdate, 'edate': edate}, timeout=10)
+                    if alt_response.status_code == 200:
+                        api_response = alt_response
+                        break
+                except:
+                    continue
+            
+            if api_response.status_code != 200:
+                print("🚫 찜카: 모든 API 호출 방법 실패")
+                return pd.DataFrame()
+        
+        # JSON 데이터 파싱
+        try:
+            data = api_response.json()
+        except json.JSONDecodeError as e:
+            print(f"🚫 찜카 JSON 파싱 실패: {e}")
+            return pd.DataFrame()
+        
+        # 데이터 추출
+        extracted_data = []
+        
+        # data가 리스트인 경우
+        if isinstance(data, list):
+            car_list = data
+        # data가 딕셔너리이고 특정 키에 리스트가 있는 경우
+        elif isinstance(data, dict):
+            # 가능한 키들을 확인
+            possible_keys = ['data', 'list', 'cars', 'items', 'results']
+            car_list = None
+            
+            for key in possible_keys:
+                if key in data and isinstance(data[key], list):
+                    car_list = data[key]
+                    break
+            
+            if car_list is None:
+                print("🚫 찜카: 데이터 리스트를 찾을 수 없습니다.")
+                return pd.DataFrame()
+        else:
+            print(f"🚫 찜카: 예상하지 못한 데이터 형태: {type(data)}")
+            return pd.DataFrame()
+        
+        # 각 차량 데이터 처리
+        for i, car_item in enumerate(car_list):
+            try:
+                if not isinstance(car_item, dict):
+                    continue
+                
+                # 기본 정보 추출
+                vendor = clean_vendor_name(car_item.get('agency', {}).get('agencyName', ''))
+                erp_name = car_item.get('erpName', '')
+                fuel_code = car_item.get('fuelCode', '')
+                base_sale_fee = car_item.get('saleFee', 0)
+                seat_cnt = car_item.get('seatCnt', 0)
+                years_code = car_item.get('yearsCode', '')
+                
+                # 보험료 계산 로직
+                additional_fee = 0
+                bohum_list = car_item.get('bohum', [])
+                
+                # bohum=full 파라미터로 요청했으므로 "고급자차"(type="full") 보험료만 선택
+                if isinstance(bohum_list, list) and len(bohum_list) > 0:
+                    for bohum_item in bohum_list:
+                        if isinstance(bohum_item, dict):
+                            # "full" 타입 또는 "고급자차" 이름을 가진 보험만 선택
+                            bohum_type = bohum_item.get('type', '')
+                            bohum_name = bohum_item.get('name', '')
+                            
+                            if bohum_type == 'full' or '고급자차' in bohum_name:
+                                additional_fee = bohum_item.get('saleFee', 0)
+                                break  # 고급자차 찾으면 중단
+                
+                # 최종 가격 계산: 기본료 + 선택된 보험료
+                total_price = base_sale_fee + additional_fee
+                
+                # 연료 타입 매핑 (찜카 전용)
+                fuel_type_mapping = {
+                    'FUEL_G': '휘발유',
+                    'FUEL_D': '경유',
+                    'FUEL_L': 'LPG',
+                    'FUEL_H': '하이브리드',
+                    'FUEL_E': '전기'
+                }
+                
+                fuel_type = fuel_type_mapping.get(str(fuel_code), fuel_code)
+                
+                # MODEL_YEAR 처리: Y_NNNN 형식에서 숫자만 추출
+                model_year_processed = ""
+                if years_code:
+                    # Y_2019,Y_2020 같은 형식에서 첫 번째 값만 추출
+                    first_year = str(years_code).split(',')[0].strip()
+                    # Y_ 제거하고 숫자만 추출
+                    if first_year.startswith('Y_'):
+                        model_year_processed = first_year[2:]  # Y_ 제거
+                    else:
+                        model_year_processed = first_year
+                
+                # 데이터 저장 - CAR_NAME을 원본명으로 초기 설정
+                row_data = {
+                    'VENDOR': vendor,
+                    'CAR_NAME': erp_name,  # 일단 원본명으로 설정
+                    'PRICE': total_price,  # 기본료 + 모든 보험료
+                    'FUEL_TYPE': fuel_type,
+                    'MODEL_YEAR': model_year_processed,
+                    'CAPACITY': seat_cnt,
+                    'PLATFORM': '찜카',
+                    'ORIGINAL_NAME': erp_name,  # 정규화 기준이 되는 원본명
+                    'ORIGIN_PRICE': base_sale_fee,  # 기본료만 저장
+                    'MARGIN': additional_fee,  # 보험료를 MARGIN으로 저장
+                    'MARGIN_RATE': None
+                }
+                
+                extracted_data.append(row_data)
+                    
+            except Exception as e:
+                continue
+        
+        # DataFrame 생성
+        df = pd.DataFrame(extracted_data)
+        
+        if not df.empty:
+            # 가격 데이터 숫자형으로 변환
+            df['PRICE'] = pd.to_numeric(df['PRICE'], errors='coerce').fillna(0).astype(int)
+            if 'ORIGIN_PRICE' in df.columns:
+                df['ORIGIN_PRICE'] = pd.to_numeric(df['ORIGIN_PRICE'], errors='coerce').fillna(0).astype(int)
+            if 'MARGIN' in df.columns:
+                df['MARGIN'] = pd.to_numeric(df['MARGIN'], errors='coerce').fillna(0).astype(int)
+            
+            # 차량명 분석 추가
+            df = enhance_dataframe_with_parsed_info(df)
+        
+        print(f"✅ 찜카 수집: {len(df)}건")
+        return df
+        
+    except requests.exceptions.RequestException as e:
+        print(f"🚫 찜카 네트워크 오류: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"🚫 찜카 예상치 못한 오류: {e}")
+        return pd.DataFrame()
+
+def convert_date_formats(sd, st, ed, et):
+    # YYYYMMDD → YYYY-MM-DD
+    if "-" not in sd:
+        sd = datetime.strptime(sd, "%Y%m%d").strftime("%Y-%m-%d")
+        ed = datetime.strptime(ed, "%Y%m%d").strftime("%Y-%m-%d")
+    # HHMM → HH:MM
+    def to_hm(x):
+        # 콜론이 있는지 확인하고 적절히 처리
+        if ":" in x:
+            return x
+        else:
+            # 길이가 4이상인지 확인
+            if len(x) >= 4:
+                return f"{x[:2]}:{x[2:]}"
+            else:
+                # 입력이 짧을 경우(예: '9'를 '09:00'으로)
+                return f"{x.zfill(2)}:00"
+    
+    hm_s, hm_e = to_hm(st), to_hm(et)
+    
+    # JejuPass용 HHMM - 콜론 제거
+    jp_s = st.replace(":", "") if ":" in st else st
+    jp_e = et.replace(":", "") if ":" in et else et
+    
+    return {
+        "std": {"sd": sd, "st": hm_s, "ed": ed, "et": hm_e},
+        "jeju": {"bd": sd, "bt": jp_s, "ed": ed, "et": jp_e},
+    }
+
+def generate_date_range(start_day=1, end_day=2):
+    jobs = []
+    for d in range(start_day, end_day + 1):
+        base = datetime.today() + timedelta(days=d)
+        for term in TRAVEL_TERMS:
+            end_dt = base + timedelta(days=term)
+            jobs.append({
+                "sd": base.strftime("%Y-%m-%d"),
+                "st": "0900",
+                "ed": end_dt.strftime("%Y-%m-%d"),
+                "et": "0900"
+            })
+    return jobs
+
+# GUI 클래스
+class RentalCarGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("제주 렌터카 통합 비교 시스템")
+        self.root.geometry("800x600")
+        self.root.resizable(True, True)
+        
+        # 스타일 설정
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        self.create_widgets()
+        
+    def create_widgets(self):
+        # 메인 프레임
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 제목
+        title_label = ttk.Label(main_frame, text="🚗 제주 렌터카 가격 통합 비교 시스템", 
+                               font=('Arial', 16, 'bold'))
+        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+        
+        # 검색 옵션 프레임
+        search_frame = ttk.LabelFrame(main_frame, text="검색 옵션", padding="10")
+        search_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # 단일 검색 vs 자동 모드
+        self.search_mode = tk.StringVar(value="single")
+        
+        single_radio = ttk.Radiobutton(search_frame, text="단일 검색", 
+                                      variable=self.search_mode, value="single",
+                                      command=self.toggle_search_mode)
+        single_radio.grid(row=0, column=0, sticky=tk.W, pady=5)
+        
+        auto_radio = ttk.Radiobutton(search_frame, text="자동 모드", 
+                                    variable=self.search_mode, value="auto",
+                                    command=self.toggle_search_mode)
+        auto_radio.grid(row=0, column=1, sticky=tk.W, pady=5)
+        
+        # 날짜/시간 입력 프레임
+        datetime_frame = ttk.LabelFrame(main_frame, text="날짜/시간 설정", padding="10")
+        datetime_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # 단일 검색용 입력
+        self.single_frame = ttk.Frame(datetime_frame)
+        self.single_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        
+        ttk.Label(self.single_frame, text="대여 시작일:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.start_date = tk.StringVar(value=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
+        ttk.Entry(self.single_frame, textvariable=self.start_date, width=12).grid(row=0, column=1, padx=5)
+
+        ttk.Label(self.single_frame, text="시작 시간:").grid(row=0, column=2, sticky=tk.W, padx=(10, 5))
+        self.start_time = tk.StringVar(value="09:00")
+        ttk.Entry(self.single_frame, textvariable=self.start_time, width=8).grid(row=0, column=3, padx=5)
+
+        ttk.Label(self.single_frame, text="반납 종료일:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.end_date = tk.StringVar(value=(datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d"))
+        ttk.Entry(self.single_frame, textvariable=self.end_date, width=12).grid(row=1, column=1, padx=5)
+        
+        ttk.Label(self.single_frame, text="종료 시간:").grid(row=1, column=2, sticky=tk.W, padx=(10, 5))
+        self.end_time = tk.StringVar(value="09:00")
+        ttk.Entry(self.single_frame, textvariable=self.end_time, width=8).grid(row=1, column=3, padx=5)
+        
+        # 자동 모드용 입력
+        self.auto_frame = ttk.Frame(datetime_frame)
+        
+        ttk.Label(self.auto_frame, text="시작일 (오늘부터 N일 후):").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.auto_start = tk.StringVar(value="1")
+        ttk.Entry(self.auto_frame, textvariable=self.auto_start, width=5).grid(row=0, column=1, padx=5)
+        
+        ttk.Label(self.auto_frame, text="종료일 (오늘부터 N일 후):").grid(row=0, column=2, sticky=tk.W, padx=(10, 5))
+        self.auto_end = tk.StringVar(value="2")
+        ttk.Entry(self.auto_frame, textvariable=self.auto_end, width=5).grid(row=0, column=3, padx=5)
+        
+        # 플랫폼 선택
+        platform_frame = ttk.LabelFrame(main_frame, text="수집 플랫폼", padding="10")
+        platform_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        self.platforms = {
+            "제주패스": tk.BooleanVar(value=True),
+            "찜카": tk.BooleanVar(value=True),
+            "카모아": tk.BooleanVar(value=True),
+            "돌하루팡": tk.BooleanVar(value=True)
+        }
+        
+        for i, (platform, var) in enumerate(self.platforms.items()):
+            ttk.Checkbutton(platform_frame, text=platform, variable=var).grid(row=0, column=i, sticky=tk.W, padx=10)
+        
+        # 버튼 프레임
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=4, column=0, columnspan=3, pady=20)
+        
+        self.search_button = ttk.Button(button_frame, text="🔍 검색 시작", 
+                                       command=self.start_search, style='Accent.TButton')
+        self.search_button.pack(side=tk.LEFT, padx=10)
+        
+        self.save_button = ttk.Button(button_frame, text="💾 결과 저장", 
+                                     command=self.save_results, state=tk.DISABLED)
+        self.save_button.pack(side=tk.LEFT, padx=10)
+        
+        # 진행 상황 표시
+        self.progress_var = tk.StringVar(value="대기 중...")
+        self.progress_label = ttk.Label(main_frame, textvariable=self.progress_var)
+        self.progress_label.grid(row=5, column=0, columnspan=3, pady=10)
+        
+        self.progress_bar = ttk.Progressbar(main_frame, mode='indeterminate')
+        self.progress_bar.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # 결과 표시 프레임
+        result_frame = ttk.LabelFrame(main_frame, text="검색 결과", padding="10")
+        result_frame.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        
+        # 결과 텍스트
+        self.result_text = tk.Text(result_frame, height=15, width=80)
+        scrollbar = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.result_text.yview)
+        self.result_text.configure(yscrollcommand=scrollbar.set)
+        
+        self.result_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        # 그리드 설정
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(7, weight=1)
+        result_frame.columnconfigure(0, weight=1)
+        result_frame.rowconfigure(0, weight=1)
+        
+        # 초기 모드 설정
+        self.toggle_search_mode()
+        
+        # 결과 저장용 변수
+        self.search_results = None
+        self.comparison_results = None
+        
+    def toggle_search_mode(self):
+        """검색 모드에 따라 UI 표시/숨김"""
+        if self.search_mode.get() == "single":
+            self.single_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+            self.auto_frame.grid_remove()
+        else:
+            self.single_frame.grid_remove()
+            self.auto_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+    
+    def start_search(self):
+        """검색 시작"""
+        # 버튼 비활성화
+        self.search_button.config(state=tk.DISABLED)
+        self.save_button.config(state=tk.DISABLED)
+        
+        # 진행 상황 초기화
+        self.progress_var.set("검색 준비 중...")
+        self.progress_bar.start()
+        self.result_text.delete(1.0, tk.END)
+        
+        # 별도 스레드에서 검색 실행
+        search_thread = threading.Thread(target=self.perform_search)
+        search_thread.daemon = True
+        search_thread.start()
+    
+    def perform_search(self):
+        """실제 검색 수행 (별도 스레드)"""
+        try:
+            if self.search_mode.get() == "single":
+                self.run_single_search_gui()
+            else:
+                self.run_auto_mode_gui()
+        except Exception as e:
+            self.update_result(f"❌ 검색 중 오류 발생: {str(e)}")
+        finally:
+            # UI 스레드에서 버튼 활성화
+            self.root.after(0, self.search_completed)
+    
+    def run_single_search_gui(self):
+        """GUI용 단일 검색"""
+        sd = self.start_date.get().replace("-", "")
+        st = self.start_time.get().replace(":", "")
+        ed = self.end_date.get().replace("-", "")
+        et = self.end_time.get().replace(":", "")
+        
+        self.update_result(f"🔍 검색 시작: {sd} {st}~{ed} {et}")
+        
+        fmt = convert_date_formats(sd, st, ed, et)
+        
+        # 선택된 플랫폼만 수집
+        dfs = []
+        
+        if self.platforms["제주패스"].get():
+            self.update_result("⏳ 제주패스 데이터 수집 중...")
+            df1 = fetch_jeju_pass_filtered(**fmt["jeju"])
+            if not df1.empty:
+                dfs.append(df1)
+                self.update_result(f"✅ 제주패스: {len(df1)}건 수집")
+        
+        if self.platforms["돌하루팡"].get():
+            self.update_result("⏳ 돌하루팡 데이터 수집 중...")
+            df2 = process_dolharupang_data(fetch_dolharupang_data(
+                fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"]))
+            if not df2.empty:
+                dfs.append(df2)
+                self.update_result(f"✅ 돌하루팡: {len(df2)}건 수집")
+        
+        if self.platforms["카모아"].get():
+            self.update_result("⏳ 카모아 데이터 수집 중...")
+            df3 = fetch_carmore_data(fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"])
+            if not df3.empty:
+                dfs.append(df3)
+                self.update_result(f"✅ 카모아: {len(df3)}건 수집")
+        
+        if self.platforms["찜카"].get():
+            self.update_result("⏳ 찜카 데이터 수집 중...")
+            df4 = fetch_zzimcar_data(fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"])
+            if not df4.empty:
+                dfs.append(df4)
+                self.update_result(f"✅ 찜카: {len(df4)}건 수집")
+        
+        # 수집 데이터 통합
+        if dfs:
+            df_all = pd.concat(dfs, ignore_index=True)
+            df_all["SEARCH_DATE"] = datetime.now().strftime("%Y-%m-%d")
+            
+            # 날짜/시간 정보 추가
+            df_all["SDATE"] = fmt["std"]["sd"]
+            df_all["STIME"] = fmt["std"]["st"]
+            df_all["EDATE"] = fmt["std"]["ed"]
+            df_all["ETIME"] = fmt["std"]["et"]
+            
+            # 가격 비교 테이블 생성
+            comparison_df = create_price_comparison_pivot(df_all)
+            
+            # 결과 저장
+            self.search_results = df_all
+            self.comparison_results = comparison_df
+            
+            self.update_result(f"\n📊 수집 완료: 총 {len(df_all)}건")
+            self.update_result(f"📋 가격 비교: {len(comparison_df)}개 차종")
+            
+            # 간단한 요약 표시
+            if not comparison_df.empty:
+                self.update_result("\n🏆 제주패스 1위 차종:")
+                rank1_cars = comparison_df[comparison_df['RANKING'] == 1]
+                for _, car in rank1_cars.iterrows():
+                    self.update_result(f"  • {car['차량정보']} - {car['제주패스']:,}원")
+                
+                self.update_result(f"\n📈 제주패스 1위 비율: {len(rank1_cars)}/{len(comparison_df)} ({len(rank1_cars)/len(comparison_df)*100:.1f}%)")
+        else:
+            self.update_result("❌ 수집된 데이터가 없습니다.")
+    
+    def run_auto_mode_gui(self):
+        """GUI용 자동 모드"""
+        start_day = int(self.auto_start.get())
+        end_day = int(self.auto_end.get())
+        
+        self.update_result(f"🔄 자동 모드 시작: {start_day}~{end_day}일")
+        
+        jobs = generate_date_range(start_day, end_day)
+        all_dfs = []
+        all_comparisons = []
+        
+        for i, j in enumerate(jobs):
+            self.update_result(f"\n📅 {i+1}/{len(jobs)}: {j['sd']} ~ {j['ed']}")
+            
+            fmt = convert_date_formats(j["sd"], j["st"], j["ed"], j["et"])
+            
+            # 선택된 플랫폼만 수집
+            dfs = []
+            
+            if self.platforms["제주패스"].get():
+                df1 = fetch_jeju_pass_filtered(**fmt["jeju"])
+                if not df1.empty:
+                    dfs.append(df1)
+            
+            if self.platforms["돌하루팡"].get():
+                df2 = process_dolharupang_data(fetch_dolharupang_data(
+                    fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"]))
+                if not df2.empty:
+                    dfs.append(df2)
+            
+            if self.platforms["카모아"].get():
+                df3 = fetch_carmore_data(fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"])
+                if not df3.empty:
+                    dfs.append(df3)
+            
+            if self.platforms["찜카"].get():
+                df4 = fetch_zzimcar_data(fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"])
+                if not df4.empty:
+                    dfs.append(df4)
+            
+            if dfs:
+                df_all = pd.concat(dfs, ignore_index=True)
+                df_all["SEARCH_DATE"] = datetime.now().strftime("%Y-%m-%d")
+                df_all["SDATE"] = fmt["std"]["sd"]
+                df_all["STIME"] = fmt["std"]["st"]
+                df_all["EDATE"] = fmt["std"]["ed"]
+                df_all["ETIME"] = fmt["std"]["et"]
+                
+                comparison_df = create_price_comparison_pivot(df_all)
+                comparison_df['검색일자'] = j["sd"]
+                comparison_df['여행기간'] = f"{j['sd']} ~ {j['ed']}"
+                
+                all_dfs.append(df_all)
+                all_comparisons.append(comparison_df)
+                
+                self.update_result(f"  ✅ 수집: {len(df_all)}건, 비교: {len(comparison_df)}개 차종")
+            else:
+                self.update_result("  ❌ 데이터 없음")
+        
+        if all_dfs:
+            # 통합 결과
+            big = pd.concat(all_dfs, ignore_index=True)
+            big_comparison = pd.concat(all_comparisons, ignore_index=True)
+            
+            self.search_results = big
+            self.comparison_results = big_comparison
+            
+            self.update_result(f"\n🎉 자동 수집 완료!")
+            self.update_result(f"📊 전체 데이터: {len(big)}건")
+            self.update_result(f"📋 가격 비교: {len(big_comparison)}건")
+        else:
+            self.update_result("❌ 전체 수집 실패")
+
+    def update_result(self, message):
+        """결과 텍스트 업데이트 (UI 스레드에서 실행)"""
+        def update():
+            self.result_text.insert(tk.END, message + "\n")
+            self.result_text.see(tk.END)
+            #self.result_text.update()
+        
+        self.root.after(0, update)
+    
+    def search_completed(self):
+        """검색 완료 후 UI 정리"""
+        self.progress_bar.stop()
+        self.progress_var.set("검색 완료")
+        self.search_button.config(state=tk.NORMAL)
+        
+        if self.search_results is not None:
+            self.save_button.config(state=tk.NORMAL)
+    
+    def save_results(self):
+        """결과 저장"""
+        if self.search_results is None:
+            messagebox.showwarning("경고", "저장할 결과가 없습니다.")
+            return
+        
+        # 저장할 폴더 선택
+        folder = filedialog.askdirectory(title="저장할 폴더 선택", initialdir=SAVE_DIR)
+        if not folder:
+            return
+        
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # 원본 데이터 저장
+            fname_raw = f"렌터카수집_{timestamp}.xlsx"
+            self.search_results.to_excel(os.path.join(folder, fname_raw), index=False)
+            
+            # 가격 비교 저장
+            if self.comparison_results is not None:
+                fname_comp = f"가격비교_{timestamp}.xlsx"
+                self.comparison_results.to_excel(os.path.join(folder, fname_comp), index=False)
+                
+                self.update_result(f"✅ 저장 완료:")
+                self.update_result(f"  📄 원본 데이터: {fname_raw}")
+                self.update_result(f"  📊 가격 비교: {fname_comp}")
+                
+                messagebox.showinfo("저장 완료", f"파일이 저장되었습니다:\n{folder}")
+            else:
+                self.update_result(f"✅ 원본 데이터만 저장: {fname_raw}")
+                messagebox.showinfo("저장 완료", f"원본 데이터가 저장되었습니다:\n{folder}")
+        
+        except Exception as e:
+            error_msg = f"저장 중 오류: {str(e)}"
+            self.update_result(f"❌ {error_msg}")
+            messagebox.showerror("저장 오류", error_msg)
+
+def run_single_search():
+    """콘솔용 단일 검색"""
+    print("🔍 단일 검색 모드")
+    sd = input("대여 시작일 (YYYYMMDD or YYYY-MM-DD): ").strip()
+    st = input("대여 시작 시분 (HHMM or HH:MM): ").strip()
+    ed = input("반납 종료일 (YYYYMMDD or YYYY-MM-DD): ").strip()
+    et = input("반납 종료 시분 (HHMM or HH:MM): ").strip()
+
+    fmt = convert_date_formats(sd, st, ed, et)
+    
+    # 4개 플랫폼 수집
+    df1 = fetch_jeju_pass_filtered(**fmt["jeju"])
+    df2 = process_dolharupang_data(fetch_dolharupang_data(
+        fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"]))
+    df3 = fetch_carmore_data(fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"])
+    df4 = fetch_zzimcar_data(fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"])
+
+    # 수집 데이터 통합
+    dfs = [df for df in (df1, df2, df3, df4) if not df.empty]
+    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+    if df_all.empty:
+        print("❌ 결과가 없습니다.")
+        return
+
+    df_all["SEARCH_DATE"] = datetime.now().strftime("%Y-%m-%d")
+    
+    # 날짜/시간 정보 추가
+    df_all["SDATE"] = fmt["std"]["sd"]
+    df_all["STIME"] = fmt["std"]["st"]
+    df_all["EDATE"] = fmt["std"]["ed"]
+    df_all["ETIME"] = fmt["std"]["et"]
+
+    print("\n📋 수집 데이터 통합 결과:")
+    print(df_all.to_string(index=False))
+
+    # 가격 비교 테이블 생성 추가
+    print("\n📊 플랫폼별 가격 비교 결과:")
+    comparison_df = create_price_comparison_pivot(df_all)
+    print(comparison_df.to_string(index=False))
+
+    if input("저장하시겠습니까? (y/n): ").lower() == "y":
+        folder = os.path.join(SAVE_DIR, datetime.today().strftime("%Y%m%d"))
+        os.makedirs(folder, exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%H%M%S')
+        
+        # 원본 데이터 저장
+        fname = f"전체수집_{timestamp}.xlsx"
+        df_all.to_excel(os.path.join(folder, fname), index=False)
+        
+        # 가격 비교 테이블 저장 추가
+        fname_comparison = f"가격비교_{timestamp}.xlsx"
+        comparison_df.to_excel(os.path.join(folder, fname_comparison), index=False)
+        
+        print("✅ 원본 데이터 저장:", fname)
+        print("✅ 가격 비교 저장:", fname_comparison)
+
+def run_auto_mode(start_day=1, end_day=2):
+    """콘솔용 자동 모드"""
+    print(f"🔄 자동 모드 {start_day}~{end_day}일")
+    jobs = generate_date_range(start_day, end_day)
+    all_dfs = []
+    all_comparisons = []  # 가격 비교 결과를 저장할 리스트 추가
+    
+    for j in jobs:
+        fmt = convert_date_formats(j["sd"], j["st"], j["ed"], j["et"])
+        
+        # 4개 플랫폼 수집
+        df1 = fetch_jeju_pass_filtered(**fmt["jeju"])
+        df2 = process_dolharupang_data(fetch_dolharupang_data(
+            fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"]))
+        df3 = fetch_carmore_data(fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"])
+        df4 = fetch_zzimcar_data(fmt["std"]["sd"], fmt["std"]["st"], fmt["std"]["ed"], fmt["std"]["et"])
+
+        # 수집 데이터 통합
+        dfs = [df for df in (df1, df2, df3, df4) if not df.empty]
+        df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        if df_all.empty:
+            continue
+
+        df_all["SEARCH_DATE"] = datetime.now().strftime("%Y-%m-%d")
+        
+        # 날짜/시간 정보 추가
+        df_all["SDATE"] = fmt["std"]["sd"]
+        df_all["STIME"] = fmt["std"]["st"]
+        df_all["EDATE"] = fmt["std"]["ed"]
+        df_all["ETIME"] = fmt["std"]["et"]
+
+        # 가격 비교 테이블 생성 추가
+        comparison_df = create_price_comparison_pivot(df_all)
+        comparison_df['검색일자'] = j["sd"]
+        comparison_df['여행기간'] = f"{j['sd']} ~ {j['ed']}"
+
+        folder = os.path.join(SAVE_DIR, datetime.today().strftime("%Y%m%d"))
+        os.makedirs(folder, exist_ok=True)
+        
+        # 원본 데이터 저장
+        fname = f"비교_{j['sd']}_{j['ed']}_{datetime.now().strftime('%H%M%S')}.csv"
+        df_all.to_csv(os.path.join(folder, fname), index=False, encoding="utf-8-sig")
+        
+        # 가격 비교 테이블 저장 추가
+        fname_comparison = f"가격비교_{j['sd']}_{j['ed']}_{datetime.now().strftime('%H%M%S')}.xlsx"
+        comparison_df.to_excel(os.path.join(folder, fname_comparison), index=False)
+        
+        print("✅ 원본 저장:", fname)
+        print("✅ 가격비교 저장:", fname_comparison)
+        
+        all_dfs.append(df_all)
+        all_comparisons.append(comparison_df)  # 가격 비교 결과 추가
+
+    if all_dfs:
+        big = pd.concat(all_dfs, ignore_index=True)
+        big_comparison = pd.concat(all_comparisons, ignore_index=True)  # 통합 가격 비교
+        
+        folder = os.path.join(SAVE_DIR, datetime.today().strftime("%Y%m%d"))
+        fn = f"test_통합전체_{datetime.now().strftime('%H%M%S')}.csv"
+        fn_comparison = f"통합가격비교_{datetime.now().strftime('%H%M%S')}.xlsx"  # 추가
+        
+        big.to_csv(os.path.join(folder, fn), index=False, encoding="utf-8-sig")
+        big_comparison.to_excel(os.path.join(folder, fn_comparison), index=False)  # 추가
+        
+        print(f"✅ 전체 통합 저장: {fn} (총 {len(big)}건)")
+        print(f"✅ 통합 가격비교 저장: {fn_comparison}")  # 추가
+
+def main():
+    """메인 실행 함수"""
+    import sys
+    
+    # 명령행 인수 확인
+    if len(sys.argv) > 1 and sys.argv[1] == "--console":
+        # 콘솔 모드
+        print("=== 제주 렌터카 통합 비교 (4개 플랫폼) ===")
+        mode = input("1) 단일 검색  2) 자동 모드: ").strip()
+        if mode == "1":
+            run_single_search()
+        else:
+            sd = int(input("시작일 (오늘로부터 N일 후, 기본 1): ") or "1")
+            ed = int(input("종료일 (오늘로부터 N일 후, 기본 2): ") or "2")
+            run_auto_mode(sd, ed)
+    else:
+        # GUI 모드 (기본)
+        try:
+            root = tk.Tk()
+            app = RentalCarGUI(root)
+            root.mainloop()
+        except ImportError:
+            print("❌ GUI 라이브러리를 찾을 수 없습니다. 콘솔 모드로 실행합니다.")
+            print("=== 제주 렌터카 통합 비교 (4개 플랫폼) ===")
+            mode = input("1) 단일 검색  2) 자동 모드: ").strip()
+            if mode == "1":
+                run_single_search()
+            else:
+                sd = int(input("시작일 (오늘로부터 N일 후, 기본 1): ") or "1")
+                ed = int(input("종료일 (오늘로부터 N일 후, 기본 2): ") or "2")
+                run_auto_mode(sd, ed)
+
+if __name__ == "__main__":
+    main()
